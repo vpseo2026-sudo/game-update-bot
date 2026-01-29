@@ -1,15 +1,13 @@
 const crypto = require("crypto");
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
 function sha1(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
 }
 
-async function supabase(path, { method = "GET", body } = {}) {
+async function supabaseFetch(path, { method = "GET", body } = {}) {
+  const SUPABASE_URL = process.env.SUPABASE_URL;
+  const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     method,
     headers: {
@@ -29,6 +27,9 @@ async function supabase(path, { method = "GET", body } = {}) {
 }
 
 async function sendTelegram(text) {
+  const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
   const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -76,30 +77,51 @@ function parseRss(xmlText) {
       published_at: pubDate ? new Date(pubDate).toISOString() : null,
     });
   }
-
   return items;
 }
 
 // ✅ Netlify expects exports.handler
 exports.handler = async () => {
   try {
-    // sanity check env vars
+    // ✅ DEBUG MODE (no DB calls, just shows what Netlify sees)
+    if (process.env.DEBUG === "1") {
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          supabaseUrl: process.env.SUPABASE_URL,
+          hasServiceRole: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+          hasTelegramToken: !!process.env.TELEGRAM_BOT_TOKEN,
+          telegramChatId: process.env.TELEGRAM_CHAT_ID,
+        }),
+      };
+    }
+
+    // ✅ Env sanity check
     const missing = [];
-    if (!SUPABASE_URL) missing.push("SUPABASE_URL");
-    if (!SUPABASE_SERVICE_ROLE) missing.push("SUPABASE_SERVICE_ROLE_KEY");
-    if (!TELEGRAM_BOT_TOKEN) missing.push("TELEGRAM_BOT_TOKEN");
-    if (!TELEGRAM_CHAT_ID) missing.push("TELEGRAM_CHAT_ID");
+    if (!process.env.SUPABASE_URL) missing.push("SUPABASE_URL");
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+    if (!process.env.TELEGRAM_BOT_TOKEN) missing.push("TELEGRAM_BOT_TOKEN");
+    if (!process.env.TELEGRAM_CHAT_ID) missing.push("TELEGRAM_CHAT_ID");
+
     if (missing.length) {
       return {
         statusCode: 500,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ok: false, error: `Missing env vars: ${missing.join(", ")}` }),
       };
     }
 
-    const sources = await supabase("sources?select=id,name,type,url&enabled=eq.true");
+    // 1) load enabled sources
+    const sources = await supabaseFetch("sources?select=id,name,type,url&enabled=eq.true");
+
     let newCount = 0;
 
     for (const src of sources) {
+      // If there is still a placeholder URL in DB, skip it instead of crashing
+      if (!src.url || src.url.includes("PASTE_RSS_URL_HERE")) continue;
+
+      // 2) fetch source
       const r = await fetch(src.url, { headers: { "User-Agent": "GameUpdateBot/1.0" } });
       if (!r.ok) continue;
 
@@ -111,12 +133,14 @@ exports.handler = async () => {
       for (const it of parsed) {
         const content_hash = sha1(`${it.title}|${it.link}|${it.published_at || ""}`);
 
-        const exists = await supabase(
+        // 3) dedupe check
+        const exists = await supabaseFetch(
           `items?select=id&source_id=eq.${src.id}&content_hash=eq.${content_hash}&limit=1`
         );
         if (exists?.length) continue;
 
-        await supabase("items", {
+        // 4) insert
+        await supabaseFetch("items", {
           method: "POST",
           body: {
             source_id: src.id,
@@ -128,6 +152,7 @@ exports.handler = async () => {
           },
         });
 
+        // 5) notify
         await sendTelegram(`🎮 New update\n${it.title}\n${it.link}`);
         newCount++;
       }
@@ -135,14 +160,14 @@ exports.handler = async () => {
 
     return {
       statusCode: 200,
-      body: JSON.stringify({ ok: true, newCount }),
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: true, newCount }),
     };
   } catch (e) {
     return {
       statusCode: 500,
-      body: JSON.stringify({ ok: false, error: e.message }),
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: false, error: e.message }),
     };
   }
 };
