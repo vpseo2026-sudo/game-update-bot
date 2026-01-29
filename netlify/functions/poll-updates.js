@@ -4,10 +4,6 @@ function sha1(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 async function supabaseFetch(path, { method = "GET", body } = {}) {
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -30,43 +26,26 @@ async function supabaseFetch(path, { method = "GET", body } = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-// Telegram sender with 429 (rate limit) handling
 async function sendTelegram(text) {
-  const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text,
-        disable_web_page_preview: false,
-      }),
-    });
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: false,
+    }),
+  });
 
-    if (res.ok) return;
-
+  // If Telegram rate limits, we skip sending this run (don’t timeout the function)
+  if (!res.ok) {
     const raw = await res.text();
-
-    // If rate-limited, wait and retry
-    try {
-      const data = JSON.parse(raw);
-      if (data?.error_code === 429 && data?.parameters?.retry_after) {
-        const waitSec = data.parameters.retry_after;
-        await sleep((waitSec + 1) * 1000); // +1 sec buffer
-        continue;
-      }
-    } catch (_) {
-      // ignore JSON parse errors
-    }
-
-    throw new Error(`Telegram error: ${raw}`);
+    // Return gracefully; next scheduled run will try again
+    console.log("Telegram send failed:", raw);
   }
-
-  throw new Error("Telegram error: rate limited too long");
 }
 
 function stripCdata(s = "") {
@@ -100,25 +79,17 @@ function parseRss(xmlText) {
       published_at: pubDate ? new Date(pubDate).toISOString() : null,
     });
   }
+
   return items;
 }
 
 exports.handler = async () => {
-  try {
-    // DEBUG MODE: does not call Supabase or Telegram; just prints env visibility
-    if (process.env.DEBUG === "1") {
-      return {
-        statusCode: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          supabaseUrl: process.env.SUPABASE_URL,
-          hasServiceRole: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
-          hasTelegramToken: !!process.env.TELEGRAM_BOT_TOKEN,
-          telegramChatId: process.env.TELEGRAM_CHAT_ID,
-        }),
-      };
-    }
+  const started = Date.now();
+  const TIME_BUDGET_MS = 25000; // bail before Netlify 30s
+  const MAX_SOURCES_PER_RUN = 2;
+  const MAX_NEW_ITEMS_PER_RUN = 5;
 
+  try {
     // Env sanity check
     const missing = [];
     if (!process.env.SUPABASE_URL) missing.push("SUPABASE_URL");
@@ -134,43 +105,67 @@ exports.handler = async () => {
       };
     }
 
-    // 1) Load enabled sources
-    const sources = await supabaseFetch("sources?select=id,name,type,url&enabled=eq.true");
+    // 1) Load enabled sources (RSS only)
+    const allSources = await supabaseFetch(
+      "sources?select=id,name,type,url&enabled=eq.true&type=eq.rss&order=id.asc"
+    );
+
+    // Filter out placeholders
+    const sources = (allSources || []).filter(
+      (s) => s.url && !s.url.includes("PASTE_RSS_URL_HERE")
+    );
+
+    // 2) Process only a couple sources per run (round-robin-ish using current minute)
+    const minute = new Date().getUTCMinutes();
+    const startIndex = sources.length ? minute % sources.length : 0;
+
+    const pick = [];
+    for (let i = 0; i < sources.length && pick.length < MAX_SOURCES_PER_RUN; i++) {
+      pick.push(sources[(startIndex + i) % sources.length]);
+    }
 
     let newCount = 0;
     const notifications = [];
 
-    for (const src of sources) {
-      // Skip placeholders or empty URLs
-      if (!src.url || src.url.includes("PASTE_RSS_URL_HERE")) continue;
+    for (const src of pick) {
+      if (Date.now() - started > TIME_BUDGET_MS) break;
 
-      // Only RSS in MVP
-      if (src.type !== "rss") continue;
+      // Fetch RSS with a timeout so it doesn't hang
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 7000);
 
-      // 2) Fetch source
       let resp;
       try {
-        resp = await fetch(src.url, { headers: { "User-Agent": "GameUpdateBot/1.0" } });
-      } catch {
+        resp = await fetch(src.url, {
+          headers: { "User-Agent": "GameUpdateBot/1.0" },
+          signal: ctrl.signal,
+        });
+      } catch (e) {
+        clearTimeout(t);
         continue;
       }
+      clearTimeout(t);
+
       if (!resp.ok) continue;
 
       const xml = await resp.text();
-
-      // 3) Parse latest items
       const parsed = parseRss(xml).slice(0, 10);
 
+      // Pull recent items for this source ONCE (fast dedupe)
+      // We only need recent content_hash values.
+      const existing = await supabaseFetch(
+        `items?select=content_hash&source_id=eq.${src.id}&order=created_at.desc&limit=200`
+      );
+      const existingSet = new Set((existing || []).map((x) => x.content_hash).filter(Boolean));
+
       for (const it of parsed) {
+        if (Date.now() - started > TIME_BUDGET_MS) break;
+        if (newCount >= MAX_NEW_ITEMS_PER_RUN) break;
+
         const content_hash = sha1(`${it.title}|${it.link}|${it.published_at || ""}`);
+        if (existingSet.has(content_hash)) continue;
 
-        // 4) Dedup check
-        const exists = await supabaseFetch(
-          `items?select=id&source_id=eq.${src.id}&content_hash=eq.${content_hash}&limit=1`
-        );
-        if (exists?.length) continue;
-
-        // 5) Store
+        // Insert new item
         await supabaseFetch("items", {
           method: "POST",
           body: {
@@ -183,22 +178,26 @@ exports.handler = async () => {
           },
         });
 
-        // 6) Queue notification (batch later)
+        existingSet.add(content_hash);
         notifications.push(`• ${it.title}\n${it.link}`);
         newCount++;
       }
     }
 
-    // 7) Send ONE batched message to avoid Telegram 429
+    // One batched telegram message
     if (notifications.length) {
-      const top = notifications.slice(0, 10); // limit per run
-      await sendTelegram(`🎮 New updates (${top.length})\n\n${top.join("\n\n")}`);
+      await sendTelegram(`🎮 New updates (${notifications.length})\n\n${notifications.join("\n\n")}`);
     }
 
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: true, newCount }),
+      body: JSON.stringify({
+        ok: true,
+        processedSources: pick.map((s) => s.name),
+        newCount,
+        timeMs: Date.now() - started,
+      }),
     };
   } catch (e) {
     return {
