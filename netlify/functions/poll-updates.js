@@ -4,6 +4,10 @@ function sha1(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function supabaseFetch(path, { method = "GET", body } = {}) {
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -26,24 +30,43 @@ async function supabaseFetch(path, { method = "GET", body } = {}) {
   return res.status === 204 ? null : res.json();
 }
 
+// Telegram sender with 429 (rate limit) handling
 async function sendTelegram(text) {
   const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      text,
-      disable_web_page_preview: false,
-    }),
-  });
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        disable_web_page_preview: false,
+      }),
+    });
 
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Telegram error: ${t}`);
+    if (res.ok) return;
+
+    const raw = await res.text();
+
+    // If rate-limited, wait and retry
+    try {
+      const data = JSON.parse(raw);
+      if (data?.error_code === 429 && data?.parameters?.retry_after) {
+        const waitSec = data.parameters.retry_after;
+        await sleep((waitSec + 1) * 1000); // +1 sec buffer
+        continue;
+      }
+    } catch (_) {
+      // ignore JSON parse errors
+    }
+
+    throw new Error(`Telegram error: ${raw}`);
   }
+
+  throw new Error("Telegram error: rate limited too long");
 }
 
 function stripCdata(s = "") {
@@ -80,10 +103,9 @@ function parseRss(xmlText) {
   return items;
 }
 
-// ✅ Netlify expects exports.handler
 exports.handler = async () => {
   try {
-    // ✅ DEBUG MODE (no DB calls, just shows what Netlify sees)
+    // DEBUG MODE: does not call Supabase or Telegram; just prints env visibility
     if (process.env.DEBUG === "1") {
       return {
         statusCode: 200,
@@ -97,7 +119,7 @@ exports.handler = async () => {
       };
     }
 
-    // ✅ Env sanity check
+    // Env sanity check
     const missing = [];
     if (!process.env.SUPABASE_URL) missing.push("SUPABASE_URL");
     if (!process.env.SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
@@ -112,34 +134,43 @@ exports.handler = async () => {
       };
     }
 
-    // 1) load enabled sources
+    // 1) Load enabled sources
     const sources = await supabaseFetch("sources?select=id,name,type,url&enabled=eq.true");
 
     let newCount = 0;
+    const notifications = [];
 
     for (const src of sources) {
-      // If there is still a placeholder URL in DB, skip it instead of crashing
+      // Skip placeholders or empty URLs
       if (!src.url || src.url.includes("PASTE_RSS_URL_HERE")) continue;
 
-      // 2) fetch source
-      const r = await fetch(src.url, { headers: { "User-Agent": "GameUpdateBot/1.0" } });
-      if (!r.ok) continue;
-
-      const text = await r.text();
+      // Only RSS in MVP
       if (src.type !== "rss") continue;
 
-      const parsed = parseRss(text).slice(0, 10);
+      // 2) Fetch source
+      let resp;
+      try {
+        resp = await fetch(src.url, { headers: { "User-Agent": "GameUpdateBot/1.0" } });
+      } catch {
+        continue;
+      }
+      if (!resp.ok) continue;
+
+      const xml = await resp.text();
+
+      // 3) Parse latest items
+      const parsed = parseRss(xml).slice(0, 10);
 
       for (const it of parsed) {
         const content_hash = sha1(`${it.title}|${it.link}|${it.published_at || ""}`);
 
-        // 3) dedupe check
+        // 4) Dedup check
         const exists = await supabaseFetch(
           `items?select=id&source_id=eq.${src.id}&content_hash=eq.${content_hash}&limit=1`
         );
         if (exists?.length) continue;
 
-        // 4) insert
+        // 5) Store
         await supabaseFetch("items", {
           method: "POST",
           body: {
@@ -152,10 +183,16 @@ exports.handler = async () => {
           },
         });
 
-        // 5) notify
-        await sendTelegram(`🎮 New update\n${it.title}\n${it.link}`);
+        // 6) Queue notification (batch later)
+        notifications.push(`• ${it.title}\n${it.link}`);
         newCount++;
       }
+    }
+
+    // 7) Send ONE batched message to avoid Telegram 429
+    if (notifications.length) {
+      const top = notifications.slice(0, 10); // limit per run
+      await sendTelegram(`🎮 New updates (${top.length})\n\n${top.join("\n\n")}`);
     }
 
     return {
